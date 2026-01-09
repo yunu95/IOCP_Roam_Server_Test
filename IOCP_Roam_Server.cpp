@@ -6,6 +6,7 @@
 #include <mutex>
 #include <string>
 #include <map>
+#include <unordered_set>
 
 #pragma comment(lib, "ws2_32.lib")
 
@@ -20,6 +21,13 @@ struct PlayerInfo {
     float x, y;
     SOCKET socket;
 };
+struct Command {
+    int playerId;
+    char move;
+};
+
+std::vector<Command> g_commandQueue;
+std::mutex g_queueLock; // Locking a queue for 1ms is much better than locking game logic
 
 // 플레이어 id별 정보 객체
 std::map<int, PlayerInfo*> g_players;
@@ -34,7 +42,7 @@ struct Session {
     char buffer[MAX_BUFFER];
     WSABUF wsaBuf;
     // 세션이 관리하는 플레이어 id
-    int playerId; 
+    int playerId;
 };
 
 // 전 플레이어들에게 브로드캐스팅
@@ -82,38 +90,11 @@ void WorkerThread() {
             continue;
         }
 
-        // --- 게임 로직 ---
-        // 1. 커맨드 파싱
         // W=Up, S=Down, A=Left, D=Right
         char command = client->buffer[0];
-
         {
-            std::lock_guard<std::mutex> lock(g_gameLock);
-            if (g_players.count(client->playerId)) {
-                PlayerInfo* p = g_players[client->playerId];
-
-                // 2. 이동 처리
-                if (command == 'W') p->y -= 1.0f;
-                if (command == 'S') p->y += 1.0f;
-                if (command == 'A') p->x -= 1.0f;
-                if (command == 'D') p->x += 1.0f;
-
-                // 3. 가장자리 처리
-                if (p->x < 1) p->x = 1;
-                if (p->x > MAP_WIDTH - 2) p->x = MAP_WIDTH - 2;
-                if (p->y < 1) p->y = 1;
-                if (p->y > MAP_HEIGHT - 2) p->y = MAP_HEIGHT - 2;
-
-                // 4. 플레이어 좌표 상태들을 모든 플레이어들에게 브로드캐스팅
-                // U 1 @ 10.0 5.0
-                char packet[64];
-                sprintf_s(packet, "U %d %c %.1f %.1f\n", p->id, p->symbol, p->x, p->y);
-
-                // 보통 WSASend로 더 효율을 높인다고 함
-                for (auto const& [id, player] : g_players) {
-                    send(player->socket, packet, (int)strlen(packet), 0);
-                }
-            }
+            std::lock_guard<std::mutex> lock(g_queueLock);
+            g_commandQueue.push_back({ client->playerId, command });
         }
 
         // 수신 초기화 및 비동기 수신 시작
@@ -122,6 +103,65 @@ void WorkerThread() {
         client->wsaBuf.buf = client->buffer;
         DWORD flags = 0;
         WSARecv(client->socket, &client->wsaBuf, 1, NULL, &flags, &client->overlapped, NULL);
+    }
+}
+void LogicThread() {
+    // command의 id가 중복되는 경우, 커맨드가 두번 실행되는 것을 막기 위한 중복방지 set
+    std::unordered_set<int> processedIds;
+    while (true) {
+        processedIds.clear();
+        std::vector<Command> processingQueue;
+
+        // Swiftly swap the queue to keep lock time near zero
+        {
+            std::lock_guard<std::mutex> lock(g_queueLock);
+            processingQueue.swap(g_commandQueue);
+        }
+
+        // Process all moves at once WITHOUT ANY LOCKS
+        for (auto it = processingQueue.rbegin(); it != processingQueue.rend(); ++it) {
+            Command& cmd = *it;
+
+            // 중복체크
+            if (processedIds.find(cmd.playerId) != processedIds.end())
+                continue;
+            processedIds.insert(cmd.playerId);
+
+            PlayerInfo* p = g_players[cmd.playerId];
+            if (!p) continue;
+
+            // Handle Movement
+            if (g_players.count(cmd.playerId)) {
+                PlayerInfo* p = g_players[cmd.playerId];
+
+                if (cmd.move == 'W') p->y -= 1.0f;
+                if (cmd.move == 'S') p->y += 1.0f;
+                if (cmd.move == 'A') p->x -= 1.0f;
+                if (cmd.move == 'D') p->x += 1.0f;
+
+                // Clamp Boundaries
+                if (p->x < 1) p->x = 1;
+                if (p->x > MAP_WIDTH - 2) p->x = MAP_WIDTH - 2;
+                if (p->y < 1) p->y = 1;
+                if (p->y > MAP_HEIGHT - 2) p->y = MAP_HEIGHT - 2;
+
+                // Broadcast Update
+                char packet[64];
+                sprintf_s(packet, "U %d %c %.1f %.1f\n", p->id, p->symbol, p->x, p->y);
+                for (auto const& [id, player] : g_players) {
+                    send(player->socket, packet, (int)strlen(packet), 0);
+                }
+            }
+            // Broadcast the new state
+            char packet[64];
+            sprintf_s(packet, "U %d %c %.1f %.1f\n", p->id, p->symbol, p->x, p->y);
+            // Broadcast is now safe because only THIS thread is touching the map
+            for (auto const& [id, player] : g_players) {
+                send(player->socket, packet, (int)strlen(packet), 0);
+            }
+        }
+
+        Sleep(16); // Run at ~60 FPS
     }
 }
 
@@ -143,8 +183,10 @@ int main() {
 
     std::thread t1(WorkerThread);
     std::thread t2(WorkerThread);
+    std::thread logicThread(LogicThread);
     t1.detach();
     t2.detach();
+    logicThread.detach();
 
     std::cout << "Game Server Started on 9000\n";
 
