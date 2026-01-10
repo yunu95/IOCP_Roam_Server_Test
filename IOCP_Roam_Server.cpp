@@ -181,11 +181,15 @@ int main() {
     // Symbols to assign to players sequentially
     const char* symbols = "@#$&%?!*";
 
-    std::thread t1(WorkerThread);
-    std::thread t2(WorkerThread);
     std::thread logicThread(LogicThread);
-    t1.detach();
-    t2.detach();
+    unsigned int numCores = std::thread::hardware_concurrency();
+    unsigned int numWorkers = numCores * 2;
+
+    for (unsigned int i = 0; i < numWorkers; i++) {
+        std::thread worker(WorkerThread);
+        worker.detach();
+    }
+
     logicThread.detach();
 
     std::cout << "Game Server Started on 9000\n";
