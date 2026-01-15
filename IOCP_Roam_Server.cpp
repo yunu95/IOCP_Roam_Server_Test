@@ -11,8 +11,8 @@
 
 #pragma comment(lib, "ws2_32.lib")
 
+RoamServer server;
 int main() {
-    RoamServer server;
     if (server.Start(9000)) server.Run();
     return 0;
 }
